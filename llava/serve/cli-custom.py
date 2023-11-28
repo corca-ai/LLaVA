@@ -1,3 +1,4 @@
+# CUDA_VISIBLE_DEVICES=5 python -m llava.serve.cli-custom --model-path liuhaotian/llava-v1.5-7b --image-file hi
 import argparse
 import torch
 
@@ -26,12 +27,30 @@ from transformers import TextStreamer
 
 
 def load_image(image_file):
-    if image_file.startswith("http://") or image_file.startswith("https://"):
-        response = requests.get(image_file)
-        image = Image.open(BytesIO(response.content)).convert("RGB")
-    else:
-        image = Image.open(image_file).convert("RGB")
+    try:
+        if image_file.startswith("http://") or image_file.startswith("https://"):
+            response = requests.get(image_file)
+            if response is None:
+                return None
+            image = Image.open(BytesIO(response.content)).convert("RGB")
+        else:
+            image = Image.open(image_file).convert("RGB")
+    except Exception as e:
+        image = None
     return image
+
+
+def get_query(category):
+    query = f"\
+        What is the color of this {category}? \
+        What are the characteristics of this {category}? \
+        Which type of person would this {category} suit best? \
+        What feeling does this {category} evoke? \
+        What is the overall impression of this {category}? \
+        What aesthetic is expressed by this {category}? \
+        Which time period or culture is this {category} reminiscent of?"
+
+    return query
 
 
 def main(args):
@@ -72,26 +91,37 @@ def main(args):
     else:
         roles = conv.roles
 
-    image = load_image(args.image_file)
-    # Similar operation in model_worker.py
-    image_tensor = process_images([image], image_processor, args)
-    if type(image_tensor) is list:
-        image_tensor = [
-            image.to(model.device, dtype=torch.float16) for image in image_tensor
-        ]
-    else:
-        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+    import pandas as pd
 
-    while True:
-        try:
-            inp = input(f"{roles[0]}: ")
-        except EOFError:
-            inp = ""
-        if not inp:
-            print("exit...")
-            break
+    df = pd.read_csv("/home/baek/LLaVA/preprocessed_data.csv")
+    types = df["type"].tolist()
+    images = df["image"].tolist()
+    results = []
+    for t, image_file in zip(types, images):
+        conv = conv_templates[args.conv_mode].copy()
+        image = load_image(image_file)
+        if image is None:
+            results.append("")
+            continue
+        # Similar operation in model_worker.py
+        image_tensor = process_images([image], image_processor, args)
+        if type(image_tensor) is list:
+            image_tensor = [
+                image.to(model.device, dtype=torch.float16) for image in image_tensor
+            ]
+        else:
+            image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
-        print(f"{roles[1]}: ", end="")
+        if t == "상의":
+            inp = get_query("top")
+        elif t == "하의":
+            inp = get_query("bottom")
+        elif t == "원피스":
+            inp = get_query("dress")
+        elif t == "양말":
+            inp = get_query("socks")
+        else:
+            raise NotImplementedError
 
         if image is not None:
             # first message
@@ -138,10 +168,13 @@ def main(args):
             )
 
         outputs = tokenizer.decode(output_ids[0, input_ids.shape[1] :]).strip()
-        conv.messages[-1][-1] = outputs
+        results.append(outputs.replace("</s>", "").strip())
+        # conv.messages[-1][-1] = outputs
 
-        if args.debug:
-            print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
+        # if args.debug:
+        # print("\n", {"prompt": prompt, "outputs": outputs}, "\n")
+    df["description"] = results
+    df.to_csv("preprocessed_data.csv", index=False)
 
 
 if __name__ == "__main__":
